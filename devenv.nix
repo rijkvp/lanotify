@@ -1,4 +1,4 @@
-{ pkgs, lib, config, inputs, ... }:
+{ pkgs, ... }:
 
 {
   languages.rust = {
@@ -7,6 +7,7 @@
   };
 
   packages = with pkgs; [
+    cargo-edit
     arp-scan
   ];
 }

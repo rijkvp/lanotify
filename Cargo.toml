@@ -4,11 +4,11 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-anyhow = "1.0.97"
-chrono = "0.4.40"
+anyhow = "1.0.98"
+chrono = "0.4.41"
 env_logger = "0.11.8"
 log = "0.4.27"
-notify-rust = "4.11.7"
 serde = { version = "1.0.219", features = ["derive"] }
 serde_with = "3.12.0"
-toml = "0.8.20"
+toml = "0.8.22"
+ureq = "3.0.11"

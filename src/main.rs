@@ -1,6 +1,5 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, Local};
-use notify_rust::Notification;
 use serde::Deserialize;
 use serde_with::serde_as;
 use std::collections::hash_map::Entry;
@@ -55,10 +54,26 @@ impl Display for Device {
 
 #[serde_as]
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, default)]
 struct Config {
     #[serde_as(as = "serde_with::DurationSeconds<u64>")]
     scan_interval: Duration,
     devices: HashMap<MacAddr, String>,
+    history_size: usize,
+    ntfy_url: String,
+    notify_unknown: bool,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            scan_interval: Duration::from_secs(10),
+            history_size: 5,
+            devices: HashMap::new(),
+            ntfy_url: "http://localhost:8080/notify".to_string(),
+            notify_unknown: true,
+        }
+    }
 }
 
 impl Config {
@@ -74,14 +89,11 @@ struct DeviceState {
     device: Device,
     last_seen: DateTime<Local>,
     is_connected: bool,
-    activity: ActivityLog,
+    status_log: StatusLog,
 }
 
-const ACTIVITY_LOG_SIZE: usize = 5;
-const CONNECTED_N: usize = 3;
-
 #[derive(Debug, Clone)]
-struct ActivityLog {
+struct StatusLog {
     log: VecDeque<bool>,
 }
 
@@ -91,26 +103,23 @@ enum ConnectionStatus {
     Disconnected,
 }
 
-impl ActivityLog {
-    fn with_initial(state: bool) -> Self {
-        let mut log = VecDeque::with_capacity(ACTIVITY_LOG_SIZE);
-        for _ in 0..ACTIVITY_LOG_SIZE {
-            log.push_back(state);
+impl StatusLog {
+    fn new(initial: bool, size: usize) -> Self {
+        Self {
+            log: VecDeque::from(vec![initial; size]),
         }
-        Self { log }
     }
 
-    fn log(&mut self, state: bool) {
-        if self.log.len() == ACTIVITY_LOG_SIZE {
-            self.log.pop_front();
-        }
+    fn update(&mut self, state: bool) {
+        self.log.pop_front();
         self.log.push_back(state);
     }
 
     fn connection_status(&self) -> ConnectionStatus {
-        let first = self.log[ACTIVITY_LOG_SIZE - CONNECTED_N];
-        for i in ACTIVITY_LOG_SIZE - CONNECTED_N + 1..ACTIVITY_LOG_SIZE {
-            if self.log[i] != first {
+        let first = self.log.front().copied().unwrap_or(false);
+        for value in self.log.iter().copied().skip(1) {
+            if value != first {
+                // if not all the same
                 return ConnectionStatus::Unsure;
             }
         }
@@ -122,7 +131,7 @@ impl ActivityLog {
     }
 }
 
-impl Display for ActivityLog {
+impl Display for StatusLog {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         for act in &self.log {
             write!(f, "{}", if *act { "O" } else { "-" })?;
@@ -132,12 +141,12 @@ impl Display for ActivityLog {
 }
 
 impl DeviceState {
-    fn new(device: Device, assume_connected: bool) -> Self {
+    fn new(device: Device, history_size: usize) -> Self {
         DeviceState {
             device,
             last_seen: Local::now(),
-            is_connected: assume_connected,
-            activity: ActivityLog::with_initial(assume_connected),
+            is_connected: true, // assume connected at first
+            status_log: StatusLog::new(true, history_size),
         }
     }
 }
@@ -152,7 +161,7 @@ impl Display for DeviceState {
         write!(
             f,
             " \t{}\t{}\t{}",
-            self.activity,
+            self.status_log,
             self.last_seen.format("%Y-%m-%d %H:%M:%S"),
             self.device
         )?;
@@ -190,32 +199,38 @@ impl Daemon {
 
     fn init_state(&mut self, devices: Vec<Device>) {
         for device in devices {
-            self.state
-                .insert(device.mac.clone(), DeviceState::new(device, true));
+            self.state.insert(
+                device.mac.clone(),
+                DeviceState::new(device, self.config.history_size),
+            );
         }
         log::info!("Initilized with {} devices", self.state.len());
     }
 
     fn update_state(&mut self, new_devices: Vec<Device>) {
+        let mut notifications = Vec::new();
         for device in &new_devices {
             match self.state.entry(device.mac.clone()) {
+                // update status existing device
                 Entry::Occupied(mut e) => {
                     let state = e.get_mut();
                     state.device = device.clone();
                     state.last_seen = Local::now();
-                    state.activity.log(true);
+                    state.status_log.update(true);
                 }
+                // found a new device
                 Entry::Vacant(e) => {
-                    e.insert(DeviceState::new(device.clone(), false));
+                    e.insert(DeviceState::new(device.clone(), self.config.history_size));
+                    notifications.push((device.clone(), true));
                 }
             }
         }
-        let mut notifications = Vec::new();
         for state in self.state.values_mut() {
+            // if the device was not found in the new scan, update its log to disconnected
             if !new_devices.iter().any(|d| d.mac == state.device.mac) {
-                state.activity.log(false);
+                state.status_log.update(false);
             }
-            match state.activity.connection_status() {
+            match state.status_log.connection_status() {
                 ConnectionStatus::Connected => {
                     if !state.is_connected {
                         state.is_connected = true;
@@ -225,7 +240,6 @@ impl Daemon {
                 ConnectionStatus::Disconnected => {
                     if state.is_connected {
                         state.is_connected = false;
-                        log::info!("Device disconnected: {}", state.device);
                         notifications.push((state.device.clone(), false));
                     }
                 }
@@ -255,16 +269,34 @@ impl Daemon {
     }
 
     fn notify(&self, device: &Device, state: bool) -> Result<()> {
-        if let Some(name) = self.config.devices.get(&device.mac) {
-            let status = if state { "connected" } else { "disconnected" };
-            Notification::new()
-                .summary(&format!("Device {} {}", name, status))
-                .body(&format!(
-                    "Device {} with IP {} and MAC {} is {}",
-                    name, device.ip, device.mac.0, status
-                ))
-                .show()?;
+        let status = if state { "connected" } else { "disconnected" };
+        if !self.config.notify_unknown && self.config.devices.get(&device.mac).is_none() {
+            log::info!(
+                "Unknown device {} with IP {} and MAC {} is {}",
+                device.vendor,
+                device.ip,
+                device.mac.0,
+                status
+            );
+            return Ok(());
         }
+
+        let name = self
+            .config
+            .devices
+            .get(&device.mac)
+            .map(|d| d.to_string())
+            .unwrap_or(format!("Unknown {}", &device.vendor));
+        let title = format!("Device {} {}", name, status);
+        let body = format!(
+            "Device {} with IP {} and MAC {} is {}",
+            name, device.ip, device.mac.0, status
+        );
+        log::info!("[notify] {title} {body}");
+        let resp = ureq::post(&self.config.ntfy_url)
+            .header("Title", &title)
+            .send(body)?;
+        println!("Notification sent: {} {:?}", resp.status(), resp.body());
         Ok(())
     }
 }
