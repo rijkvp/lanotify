@@ -20,7 +20,7 @@
         commonArgs = {
           src = craneLib.cleanCargoSource ./.;
           strictDeps = true;
-          buildInputs = [
+          propagatedBuildInputs = [
             pkgs.arp-scan
           ];
         };
