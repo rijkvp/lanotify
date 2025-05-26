@@ -2,15 +2,16 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Local};
 use serde::Deserialize;
 use serde_with::serde_as;
-use std::collections::hash_map::Entry;
-use std::collections::{HashMap, VecDeque};
-use std::fmt::Display;
-use std::fs;
-use std::net::Ipv4Addr;
-use std::path::Path;
-use std::process::Command;
-use std::thread::sleep;
-use std::time::Duration;
+use std::{
+    collections::{HashMap, VecDeque, hash_map::Entry},
+    fmt::Display,
+    fs,
+    net::Ipv4Addr,
+    path::{Path, PathBuf},
+    process::Command,
+    thread::sleep,
+    time::Duration,
+};
 
 fn main() -> Result<()> {
     env_logger::builder()
@@ -18,8 +19,14 @@ fn main() -> Result<()> {
         .parse_default_env()
         .init();
 
-    let config = Config::load(Path::new("config.toml")).context("Failed to load config file")?;
-    log::info!("Loaded config: {:#?}", config);
+    let config_path = if let Some(arg) = std::env::args().skip(1).next() {
+        PathBuf::from(arg)
+    } else {
+        PathBuf::from("config.toml")
+    };
+    log::info!("loading config from '{}'", config_path.display());
+
+    let config = Config::load(&config_path).context("Failed to load config file")?;
 
     Daemon::new(config).run()?;
 
