@@ -20,15 +20,18 @@
         commonArgs = {
           src = craneLib.cleanCargoSource ./.;
           strictDeps = true;
-          propagatedBuildInputs = [
-            pkgs.arp-scan
-          ];
         };
 
         crate = craneLib.buildPackage (
           commonArgs
           // {
             cargoArtifacts = craneLib.buildDepsOnly commonArgs;
+            nativeBuildInputs = [ pkgs.makeWrapper ];
+            propagatedBuildInputs = [ pkgs.arp-scan ];
+            postInstall = ''
+              wrapProgram $out/bin/lanotify \
+                --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.arp-scan ]}
+            '';
           }
         );
       in
