@@ -1,12 +1,4 @@
-# Devenv
-.devenv*
-devenv.local.nix
-
-# direnv
-.direnv
-
-# pre-commit
-.pre-commit-config.yaml
+/.direnv
 
 # Added by cargo
 /target
