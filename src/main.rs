@@ -13,6 +13,9 @@ use std::{
     time::Duration,
 };
 
+const HISTORY_SIZE: usize = 30;
+const RECENT_SIZE: usize = 10;
+
 fn main() -> Result<()> {
     env_logger::builder()
         .filter_level(log::LevelFilter::Info)
@@ -66,7 +69,6 @@ struct Config {
     #[serde_as(as = "serde_with::DurationSeconds<u64>")]
     scan_interval: Duration,
     devices: HashMap<MacAddr, String>,
-    history_size: usize,
     ntfy_url: String,
     notify_unknown: bool,
 }
@@ -75,7 +77,6 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             scan_interval: Duration::from_secs(10),
-            history_size: 5,
             devices: HashMap::new(),
             ntfy_url: "http://localhost:8080/notify".to_string(),
             notify_unknown: true,
@@ -96,49 +97,79 @@ struct DeviceState {
     device: Device,
     last_seen: DateTime<Local>,
     is_connected: bool,
-    status_log: StatusLog,
+    ping_history: PingHistory,
 }
 
 #[derive(Debug, Clone)]
-struct StatusLog {
+struct PingHistory {
     log: VecDeque<bool>,
 }
 
-enum ConnectionStatus {
-    Unsure,
-    Connected,
-    Disconnected,
+enum DeviceStatus {
+    Online,
+    Offline,
 }
 
-impl StatusLog {
-    fn new(initial: bool, size: usize) -> Self {
+impl PingHistory {
+    fn new() -> Self {
         Self {
-            log: VecDeque::from(vec![initial; size]),
+            log: VecDeque::new(),
         }
     }
 
     fn update(&mut self, state: bool) {
-        self.log.pop_front();
-        self.log.push_back(state);
+        self.log.push_front(state);
+        if self.log.len() > HISTORY_SIZE {
+            self.log.pop_back();
+        }
     }
 
-    fn connection_status(&self) -> ConnectionStatus {
-        let first = self.log.front().copied().unwrap_or(false);
-        for value in self.log.iter().copied().skip(1) {
-            if value != first {
-                // if not all the same
-                return ConnectionStatus::Unsure;
-            }
+    fn connection_status(&self, is_connected: bool) -> DeviceStatus {
+        if self.log.len() < HISTORY_SIZE {
+            return if is_connected {
+                DeviceStatus::Online
+            } else {
+                DeviceStatus::Offline
+            };
         }
-        if first {
-            ConnectionStatus::Connected
+
+        let last_ping = self.log.iter().position(|v| *v).unwrap_or(HISTORY_SIZE);
+        let base_rate =
+            self.log.iter().map(|v| *v as u64).sum::<u64>() as f64 / self.log.len() as f64;
+        if base_rate <= 0.3 {
+            // devices that are sleeping a lot
+            if last_ping >= HISTORY_SIZE {
+                DeviceStatus::Offline
+            } else {
+                DeviceStatus::Online
+            }
+        } else if base_rate < 0.8 {
+            // devices that are sleeping frequently
+            if last_ping >= HISTORY_SIZE / 2 {
+                DeviceStatus::Offline
+            } else {
+                DeviceStatus::Online
+            }
         } else {
-            ConnectionStatus::Disconnected
+            // always-on devices
+            let recent_rate = self
+                .log
+                .iter()
+                .take(RECENT_SIZE)
+                .map(|v| *v as u64)
+                .sum::<u64>() as f64
+                / RECENT_SIZE as f64;
+            let deviation_ratio = (recent_rate - base_rate) / (base_rate + 0.01);
+            if deviation_ratio < -0.6 && recent_rate < 0.3 || last_ping > RECENT_SIZE {
+                DeviceStatus::Offline
+            } else {
+                DeviceStatus::Online
+            }
         }
     }
 }
 
-impl Display for StatusLog {
+impl Display for PingHistory {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         for act in &self.log {
             write!(f, "{}", if *act { "O" } else { "-" })?;
@@ -148,12 +179,12 @@ impl Display for StatusLog {
 }
 
 impl DeviceState {
-    fn new(device: Device, history_size: usize) -> Self {
+    fn new(device: Device) -> Self {
         DeviceState {
             device,
             last_seen: Local::now(),
             is_connected: true, // assume connected at first
-            status_log: StatusLog::new(true, history_size),
+            ping_history: PingHistory::new(),
         }
     }
 }
@@ -168,7 +199,7 @@ impl Display for DeviceState {
         write!(
             f,
             " \t{}\t{}\t{}",
-            self.status_log,
+            self.ping_history,
             self.last_seen.format("%Y-%m-%d %H:%M:%S"),
             self.device
         )?;
@@ -206,10 +237,8 @@ impl Daemon {
 
     fn init_state(&mut self, devices: Vec<Device>) {
         for device in devices {
-            self.state.insert(
-                device.mac.clone(),
-                DeviceState::new(device, self.config.history_size),
-            );
+            self.state
+                .insert(device.mac.clone(), DeviceState::new(device));
         }
         log::info!("Initilized with {} devices", self.state.len());
     }
@@ -223,11 +252,11 @@ impl Daemon {
                     let state = e.get_mut();
                     state.device = device.clone();
                     state.last_seen = Local::now();
-                    state.status_log.update(true);
+                    state.ping_history.update(true);
                 }
                 // found a new device
                 Entry::Vacant(e) => {
-                    e.insert(DeviceState::new(device.clone(), self.config.history_size));
+                    e.insert(DeviceState::new(device.clone()));
                     notifications.push((device.clone(), true));
                 }
             }
@@ -235,22 +264,21 @@ impl Daemon {
         for state in self.state.values_mut() {
             // if the device was not found in the new scan, update its log to disconnected
             if !new_devices.iter().any(|d| d.mac == state.device.mac) {
-                state.status_log.update(false);
+                state.ping_history.update(false);
             }
-            match state.status_log.connection_status() {
-                ConnectionStatus::Connected => {
+            match state.ping_history.connection_status(state.is_connected) {
+                DeviceStatus::Online => {
                     if !state.is_connected {
                         state.is_connected = true;
                         notifications.push((state.device.clone(), true));
                     }
                 }
-                ConnectionStatus::Disconnected => {
+                DeviceStatus::Offline => {
                     if state.is_connected {
                         state.is_connected = false;
                         notifications.push((state.device.clone(), false));
                     }
                 }
-                ConnectionStatus::Unsure => {}
             }
         }
         for (device, state) in notifications {
