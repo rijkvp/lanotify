@@ -56,12 +56,6 @@ struct Device {
     vendor: String,
 }
 
-impl Display for Device {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}\t{}\t{}", self.mac.0, self.ip, self.vendor)
-    }
-}
-
 #[serde_as]
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields, default)]
@@ -198,10 +192,11 @@ impl Display for DeviceState {
         };
         write!(
             f,
-            " \t{}\t{}\t{}",
+            " \t{}\t{}\t{}\t{}",
             self.ping_history,
             self.last_seen.format("%Y-%m-%d %H:%M:%S"),
-            self.device
+            self.device.mac.0,
+            self.device.ip,
         )?;
         Ok(())
     }
@@ -290,14 +285,17 @@ impl Daemon {
 
     fn log_state(&self) {
         let mut mapping: Vec<(MacAddr, DeviceState)> = self.state.clone().into_iter().collect();
-        mapping.sort_by(|a, b| a.0.cmp(&b.0));
-        println!("Status of {} devices", mapping.len());
+        mapping.sort_by_key(|(_, s)| {
+            let name = self.config.devices.get(&s.device.mac);
+            (name.is_none(), name.cloned())
+        });
+        println!("Status of {} devices:", mapping.len());
         for (_, state) in mapping {
             print!("{state}\t");
             if let Some(name) = self.config.devices.get(&state.device.mac) {
-                print!(" {name}");
+                print!("{name}");
             } else {
-                print!(" (unknown)");
+                print!("Unknown: {}", state.device.vendor);
             }
             println!();
         }
@@ -316,20 +314,20 @@ impl Daemon {
             return Ok(());
         }
 
-        let name = self
-            .config
-            .devices
-            .get(&device.mac)
+        let name = self.config.devices.get(&device.mac);
+        let priority = if name.is_some() { "default" } else { "high" };
+        let display_name = name
             .map(|d| d.to_string())
             .unwrap_or(format!("Unknown {}", &device.vendor));
-        let title = format!("Device {} {}", name, status);
+        let title = format!("Device {} {}", display_name, status);
         let body = format!(
             "Device {} with IP {} and MAC {} is {}",
-            name, device.ip, device.mac.0, status
+            display_name, device.ip, device.mac.0, status
         );
         log::info!("[notify] {title} {body}");
         let resp = ureq::post(&self.config.ntfy_url)
             .header("Title", &title)
+            .header("X-Priority", priority)
             .send(body)?;
         println!("Notification sent: {} {:?}", resp.status(), resp.body());
         Ok(())
