@@ -4,7 +4,7 @@ use serde::Deserialize;
 use serde_with::serde_as;
 use std::{
     collections::{HashMap, VecDeque, hash_map::Entry},
-    fmt::Display,
+    fmt::{Display, Write},
     fs,
     net::Ipv4Addr,
     path::{Path, PathBuf},
@@ -166,7 +166,10 @@ impl PingHistory {
 impl Display for PingHistory {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         for act in &self.log {
-            write!(f, "{}", if *act { "O" } else { "-" })?;
+            f.write_char(if *act { 'O' } else { '-' })?;
+        }
+        for _ in 0..(HISTORY_SIZE - self.log.len()) {
+            f.write_char('.')?;
         }
         Ok(())
     }
@@ -192,7 +195,7 @@ impl Display for DeviceState {
         };
         write!(
             f,
-            " \t{}\t{}\t{}\t{}",
+            "  {}  {}  {}  {:15}",
             self.ping_history,
             self.last_seen.format("%Y-%m-%d %H:%M:%S"),
             self.device.mac.0,
@@ -291,7 +294,7 @@ impl Daemon {
         });
         println!("Status of {} devices:", mapping.len());
         for (_, state) in mapping {
-            print!("{state}\t");
+            print!("{state}  ");
             if let Some(name) = self.config.devices.get(&state.device.mac) {
                 print!("{name}");
             } else {
