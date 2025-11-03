@@ -14,7 +14,8 @@ use std::{
 };
 
 const HISTORY_SIZE: usize = 30;
-const RECENT_SIZE: usize = 10;
+const OFFLINE_THRESHOLD: usize = 10;
+const RECENT_WINDOW: usize = 5;
 
 fn main() -> Result<()> {
     env_logger::builder()
@@ -91,23 +92,26 @@ struct DeviceState {
     device: Device,
     last_seen: DateTime<Local>,
     is_connected: bool,
-    ping_history: PingHistory,
+    ping_history: ScanHistory,
 }
 
 #[derive(Debug, Clone)]
-struct PingHistory {
+struct ScanHistory {
     log: VecDeque<bool>,
 }
 
-enum DeviceStatus {
-    Online,
-    Offline,
-}
-
-impl PingHistory {
+impl ScanHistory {
     fn new() -> Self {
         Self {
             log: VecDeque::new(),
+        }
+    }
+
+    #[cfg(test)]
+    fn from(array: Vec<bool>) -> Self {
+        assert_eq!(array.len(), HISTORY_SIZE);
+        Self {
+            log: VecDeque::from(array),
         }
     }
 
@@ -118,52 +122,54 @@ impl PingHistory {
         }
     }
 
-    fn connection_status(&self, is_connected: bool) -> DeviceStatus {
-        if self.log.len() < HISTORY_SIZE {
-            return if is_connected {
-                DeviceStatus::Online
-            } else {
-                DeviceStatus::Offline
-            };
+    // Determines statistically if the device is likely to be connected or disconnected
+    // Takes in the current connection state
+    fn is_connected(&self, is_connected: bool) -> bool {
+        if self.log.len() < OFFLINE_THRESHOLD {
+            // Insufficient data
+            return is_connected;
         }
 
         let last_ping = self.log.iter().position(|v| *v).unwrap_or(HISTORY_SIZE);
         let base_rate =
             self.log.iter().map(|v| *v as u64).sum::<u64>() as f64 / self.log.len() as f64;
         if base_rate <= 0.3 {
-            // devices that are sleeping a lot
+            // Devices that are sleeping a lot, or a device that has just gone offline!
             if last_ping >= HISTORY_SIZE {
-                DeviceStatus::Offline
+                false
+            } else if last_ping < RECENT_WINDOW {
+                true
             } else {
-                DeviceStatus::Online
+                is_connected
             }
-        } else if base_rate < 0.8 {
-            // devices that are sleeping frequently
-            if last_ping >= HISTORY_SIZE / 2 {
-                DeviceStatus::Offline
+        } else if base_rate <= 0.5 {
+            // Intermittent devices
+            if last_ping > OFFLINE_THRESHOLD {
+                false
             } else {
-                DeviceStatus::Online
+                true
             }
         } else {
-            // always-on devices
+            // Always-on devices devices
             let recent_rate = self
                 .log
                 .iter()
-                .take(RECENT_SIZE)
+                .take(RECENT_WINDOW)
                 .map(|v| *v as u64)
                 .sum::<u64>() as f64
-                / RECENT_SIZE as f64;
+                / RECENT_WINDOW as f64;
             let deviation_ratio = (recent_rate - base_rate) / (base_rate + 0.01);
-            if deviation_ratio < -0.6 && recent_rate < 0.3 || last_ping > RECENT_SIZE {
-                DeviceStatus::Offline
+
+            if is_connected && deviation_ratio < -0.6 && !self.log.front().unwrap() {
+                false
             } else {
-                DeviceStatus::Online
+                is_connected
             }
         }
     }
 }
 
-impl Display for PingHistory {
+impl Display for ScanHistory {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         for act in &self.log {
             f.write_char(if *act { 'O' } else { '-' })?;
@@ -181,7 +187,7 @@ impl DeviceState {
             device,
             last_seen: Local::now(),
             is_connected: true, // assume connected at first
-            ping_history: PingHistory::new(),
+            ping_history: ScanHistory::new(),
         }
     }
 }
@@ -264,18 +270,15 @@ impl Daemon {
             if !new_devices.iter().any(|d| d.mac == state.device.mac) {
                 state.ping_history.update(false);
             }
-            match state.ping_history.connection_status(state.is_connected) {
-                DeviceStatus::Online => {
-                    if !state.is_connected {
-                        state.is_connected = true;
-                        notifications.push((state.device.clone(), true));
-                    }
+            if state.ping_history.is_connected(state.is_connected) {
+                if !state.is_connected {
+                    state.is_connected = true;
+                    notifications.push((state.device.clone(), true));
                 }
-                DeviceStatus::Offline => {
-                    if state.is_connected {
-                        state.is_connected = false;
-                        notifications.push((state.device.clone(), false));
-                    }
+            } else {
+                if state.is_connected {
+                    state.is_connected = false;
+                    notifications.push((state.device.clone(), false));
                 }
             }
         }
@@ -365,4 +368,128 @@ fn arp_scan() -> Result<Vec<Device>> {
         .collect::<Result<Vec<_>>>()?;
 
     Ok(devices)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_connected_always_on() {
+        let mut history = ScanHistory::from(vec![true; HISTORY_SIZE]);
+        let mut is_connected = true;
+
+        // for a short while it stays connected
+        for _ in 0..3 {
+            history.update(false);
+            is_connected = history.is_connected(is_connected);
+            assert!(is_connected);
+        }
+
+        // stay disconnected
+        for _ in 0..HISTORY_SIZE {
+            history.update(false);
+            is_connected = history.is_connected(is_connected);
+            assert!(!is_connected);
+        }
+    }
+
+    #[test]
+    fn test_connected_always_on_temporary_offline() {
+        let mut history = ScanHistory::from(vec![true; HISTORY_SIZE]);
+
+        // 3x scan misses
+        for _ in 0..3 {
+            history.update(false);
+        }
+
+        let mut is_connected = true;
+
+        // stay connected
+        for _ in 0..HISTORY_SIZE {
+            is_connected = history.is_connected(is_connected);
+            assert!(is_connected);
+            history.update(true);
+        }
+    }
+
+    #[test]
+    fn test_connected_sleeping() {
+        let mut history = ScanHistory::new();
+        for i in 0..HISTORY_SIZE {
+            history.update(i % 10 == 0); // 10% activity
+        }
+
+        let mut is_connected = true;
+        is_connected = history.is_connected(is_connected);
+        assert!(is_connected);
+
+        // stays connected the entire time
+        for _ in 0..HISTORY_SIZE {
+            history.update(false);
+            assert!(is_connected);
+        }
+
+        is_connected = history.is_connected(is_connected);
+        assert!(!is_connected);
+    }
+
+    #[test]
+    fn test_connected_intermittent() {
+        let mut history = ScanHistory::new();
+        let mut is_connected = true;
+        for i in 0..HISTORY_SIZE {
+            is_connected = history.is_connected(is_connected);
+            assert!(is_connected);
+            history.update(i % 2 == 0); // 50% activity
+        }
+        for _ in 0..OFFLINE_THRESHOLD {
+            history.update(false);
+        }
+        for _ in 0..HISTORY_SIZE {
+            is_connected = history.is_connected(is_connected);
+            assert!(!is_connected);
+            history.update(false);
+        }
+    }
+
+    #[test]
+    fn test_connected_new_sleeping() {
+        let mut is_connected = true;
+        let mut history = ScanHistory::new();
+        for i in 0..(HISTORY_SIZE * 2) {
+            is_connected = history.is_connected(is_connected);
+            assert!(is_connected);
+            history.update(i % 20 == 0); // very low activity
+        }
+    }
+
+    #[test]
+    fn test_connected_intervals() {
+        // on and off in intervals
+        for x in 1..RECENT_WINDOW {
+            let mut is_connected = true;
+            let mut history = ScanHistory::new();
+            for y in 0..HISTORY_SIZE {
+                for z in 0..OFFLINE_THRESHOLD {
+                    // offset of z
+                    for _ in 0..z {
+                        history.update(false);
+                    }
+                    // x times on
+                    for _ in 0..x {
+                        is_connected = history.is_connected(is_connected);
+                        assert!(is_connected, "x={x}, y={y}, z={z}, {history}");
+                        history.update(true);
+                    }
+                    // x times off
+                    for _ in 0..x {
+                        is_connected = history.is_connected(is_connected);
+                        assert!(is_connected, "x={x}, y={y}, z={z} {history}");
+                        history.update(false);
+                    }
+                }
+            }
+        }
+    }
 }
