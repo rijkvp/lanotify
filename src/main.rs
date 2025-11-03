@@ -142,25 +142,20 @@ impl ScanHistory {
             } else {
                 is_connected
             }
-        } else if base_rate <= 0.5 {
+        } else if base_rate <= 0.7 {
             // Intermittent devices
-            if last_ping > OFFLINE_THRESHOLD {
+            if is_connected && last_ping > OFFLINE_THRESHOLD {
                 false
-            } else {
+            } else if !is_connected && last_ping < RECENT_WINDOW {
                 true
+            } else {
+                is_connected
             }
         } else {
             // Always-on devices devices
-            let recent_rate = self
-                .log
-                .iter()
-                .take(RECENT_WINDOW)
-                .map(|v| *v as u64)
-                .sum::<u64>() as f64
-                / RECENT_WINDOW as f64;
-            let deviation_ratio = (recent_rate - base_rate) / (base_rate + 0.01);
-
-            if is_connected && deviation_ratio < -0.6 && !self.log.front().unwrap() {
+            if *self.log.front().unwrap() {
+                true
+            } else if is_connected && last_ping > RECENT_WINDOW {
                 false
             } else {
                 is_connected
@@ -380,7 +375,7 @@ mod tests {
         let mut is_connected = true;
 
         // for a short while it stays connected
-        for _ in 0..3 {
+        for _ in 0..RECENT_WINDOW {
             history.update(false);
             is_connected = history.is_connected(is_connected);
             assert!(is_connected);
@@ -489,6 +484,32 @@ mod tests {
                         history.update(false);
                     }
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn test_regression() {
+        let patterns = &[
+            "-OO----O-O-OO-OOO-O-OOOOOOOO--",
+            "--O--OOOOOOOOOOOOOOOOOOOOOOOOO",
+            "-OOOO--O-OO----OOO--O--OOOOOOO",
+        ];
+        let mut history = ScanHistory::new();
+        let mut is_connected = true;
+        for p in patterns {
+            for (i, c) in p.chars().rev().enumerate() {
+                match c {
+                    'O' => {
+                        history.update(true);
+                    }
+                    '-' => {
+                        history.update(false);
+                    }
+                    _ => panic!(),
+                }
+                is_connected = history.is_connected(is_connected);
+                assert!(is_connected, "{history} i={i}");
             }
         }
     }
